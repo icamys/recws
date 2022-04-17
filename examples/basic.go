@@ -8,17 +8,21 @@ import (
 )
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
 	ws, err := recws.New(
-		"wss://echo.websocket.org", nil,
+		"wss://ws.postman-echo.com/raw", nil,
 		recws.WithKeepAliveTimeout(10*time.Second),
+		recws.WithHandshakeTimeout(10*time.Second),
 	)
 	if err != nil {
 		panic(err)
 	}
 
-	ws.Dial()
+	err = ws.Dial()
+	if err != nil {
+		panic(err)
+	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(2 * time.Second)
 		cancel()
@@ -27,7 +31,7 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			go ws.Close()
+			go ws.Shutdown(2 * time.Second)
 			log.Printf("Websocket closed %s", ws.GetURL())
 			return
 		default:

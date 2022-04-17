@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	closedState = iota
+	closedState = 1 << iota
 	connectingState
 	connectedState
+	closedForeverState
 )
 
 var (
@@ -32,7 +33,7 @@ var (
 type RecConn interface {
 	// Close closes the underlying network connection without
 	// sending or waiting for a close frame.
-	Close()
+	Close(forever bool)
 
 	// CloseAndReconnect closes the underlying connection and tries to reconnect.
 	CloseAndReconnect()
@@ -71,10 +72,10 @@ type RecConn interface {
 	ReadJSON(v interface{}) error
 
 	// Dial creates a new client connection by calling DialContext with a background context.
-	Dial()
+	Dial() error
 
 	// DialContext creates a new client connection.
-	DialContext(ctx context.Context)
+	DialContext(ctx context.Context) error
 
 	// GetURL returns connection url.
 	GetURL() string
@@ -83,9 +84,6 @@ type RecConn interface {
 	// Useful when WebSocket handshake fails,
 	// so that callers can handle redirects, authentication, etc.
 	GetHTTPResponse() *http.Response
-
-	// GetDialError returns the last dialer error or nil on successful connection.
-	GetDialError() error
 
 	// IsConnected returns true if the websocket client is connected to the server.
 	IsConnected() bool
@@ -99,9 +97,7 @@ type recConn struct {
 	url       string
 	reqHeader http.Header
 	httpResp  *http.Response
-	dialErr   error
 	dialer    *websocket.Dialer
-	ctx       context.Context
 
 	*websocket.Conn
 }
@@ -166,30 +162,41 @@ func New(url string, requestHeader http.Header, options ...Option) (RecConn, err
 }
 
 func (rc *recConn) CloseAndReconnect() {
-	rc.Close()
-	go rc.connect(nil)
+	rc.Close(false)
+	go func() {
+		if err := rc.reconnect(); err != nil {
+			rc.options.LogFn.Error(err, "connection error")
+		}
+	}()
 }
 
-func (rc *recConn) Close() {
+func (rc *recConn) Close(forever bool) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 
-	if rc.state != connectedState {
+	if rc.state&(closedState|closedForeverState) > 0 {
 		return
 	}
 	if err := rc.Conn.Close(); err != nil {
 		rc.options.LogFn.Error(err, "websocket connection closing error")
 	}
-	rc.state = closedState
+	if forever {
+		rc.state = closedForeverState
+	} else {
+		rc.state = closedState
+	}
 }
 
 func (rc *recConn) Shutdown(writeWait time.Duration) {
+	if rc.isState(closedState | closedForeverState) {
+		return
+	}
 	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
 	err := rc.WriteControl(websocket.CloseMessage, msg, time.Now().Add(writeWait))
 	if err != nil && err != websocket.ErrCloseSent {
 		rc.options.LogFn.Error(err, "shutdown error")
 		// If close message could not be sent, then close without the handshake.
-		rc.Close()
+		rc.Close(true)
 	}
 }
 
@@ -198,7 +205,7 @@ func (rc *recConn) ReadMessage() (messageType int, message []byte, err error) {
 	if rc.IsConnected() {
 		messageType, message, err = rc.Conn.ReadMessage()
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close()
+			rc.Close(false)
 			return messageType, message, nil
 		}
 		if err != nil {
@@ -216,7 +223,7 @@ func (rc *recConn) WriteMessage(messageType int, data []byte) error {
 		err = rc.Conn.WriteMessage(messageType, data)
 		rc.mu.Unlock()
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close()
+			rc.Close(false)
 			return nil
 		}
 		if err != nil {
@@ -234,7 +241,7 @@ func (rc *recConn) WriteJSON(v interface{}) error {
 		err = rc.Conn.WriteJSON(v)
 		rc.mu.Unlock()
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close()
+			rc.Close(false)
 			return nil
 		}
 		if err != nil {
@@ -251,7 +258,7 @@ func (rc *recConn) ReadJSON(v interface{}) error {
 		err = rc.Conn.ReadJSON(v)
 		if err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				rc.Close()
+				rc.Close(false)
 				return nil
 			}
 			rc.CloseAndReconnect()
@@ -261,30 +268,67 @@ func (rc *recConn) ReadJSON(v interface{}) error {
 	return err
 }
 
-func (rc *recConn) Dial() {
-	rc.DialContext(context.Background())
+func (rc *recConn) Dial() error {
+	return rc.DialContext(context.Background())
 }
 
-func (rc *recConn) DialContext(ctx context.Context) {
-	rc.ctx = ctx
+func (rc *recConn) DialContext(ctx context.Context) error {
+	if !rc.setStateIfNot(connectingState, connectingState|connectedState) {
+		return nil
+	}
 
-	// Connect
-	connectedCh := make(chan struct{})
-	go rc.connect(connectedCh)
-	defer close(connectedCh)
+	wsConn, httpResp, err := rc.dialer.DialContext(ctx, rc.url, rc.reqHeader)
+	if err != nil {
+		rc.setState(closedState)
+		return err
+	}
 
-	// wait for first attempt, but only up to a point
-	timer := time.NewTimer(rc.options.HandshakeTimeout)
-	defer timer.Stop()
+	rc.mu.Lock()
+	rc.Conn = wsConn
+	rc.state = connectedState
+	rc.httpResp = httpResp
+	rc.mu.Unlock()
 
-	// no default case means this select will block until one of these conditions is met.
-	// this is still guaranteed to complete, since the fallback here is the timer
-	select {
-	// in this case, the dial error is deferred until rc.GetDialError()
-	case <-timer.C:
-		return
-	case <-connectedCh:
-		return
+	rc.options.OnConnectCallback()
+	if rc.options.KeepAliveTimeout != 0 {
+		rc.keepAlive()
+	}
+
+	return nil
+}
+
+func (rc *recConn) reconnect() error {
+	if !rc.setStateIfNot(connectingState, connectingState|connectedState|closedForeverState) {
+		return nil
+	}
+
+	b := rc.makeBackoff()
+	rand.Seed(time.Now().UTC().UnixNano())
+
+	for {
+		wsConn, httpResp, err := rc.dialer.Dial(rc.url, rc.reqHeader)
+
+		rc.mu.Lock()
+		rc.Conn = wsConn
+		if err == nil {
+			rc.state = connectedState
+		} else {
+			rc.state = closedState
+		}
+		rc.httpResp = httpResp
+		rc.mu.Unlock()
+
+		if err == nil {
+			rc.options.OnConnectCallback()
+			if rc.options.KeepAliveTimeout != 0 {
+				rc.keepAlive()
+			}
+			return nil
+		}
+
+		waitDuration := b.Duration()
+		rc.options.LogFn.Error(err, fmt.Sprintf("dial error, will try again in %d seconds", waitDuration))
+		time.Sleep(waitDuration)
 	}
 }
 
@@ -351,59 +395,21 @@ func (rc *recConn) setState(state int) {
 	rc.state = state
 }
 
-func (rc *recConn) getState() int {
+func (rc *recConn) isState(s int) bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
-	return rc.state
+	return (rc.state & s) > 0
 }
 
-func (rc *recConn) connect(connCh chan<- struct{}) {
-	defer func() {
-		if connCh != nil {
-			connCh <- struct{}{}
-		}
-	}()
+func (rc *recConn) setStateIfNot(targetState, conditionState int) bool {
+	rc.mu.RLock()
+	defer rc.mu.RUnlock()
 
-	if rc.getState() == connectingState {
-		return
+	if !(rc.state&conditionState > 0) {
+		rc.state = targetState
 	}
-	rc.setState(connectingState)
 
-	b := rc.makeBackoff()
-	rand.Seed(time.Now().UTC().UnixNano())
-
-	for {
-		wsConn, httpResp, err := rc.dialer.DialContext(rc.ctx, rc.url, rc.reqHeader)
-
-		rc.mu.Lock()
-		rc.Conn = wsConn
-		rc.dialErr = err
-		if err == nil {
-			rc.state = connectedState
-		} else {
-			rc.state = closedState
-		}
-		rc.httpResp = httpResp
-		rc.mu.Unlock()
-
-		if err == nil {
-			rc.options.LogFn.Debug(fmt.Sprintf("dial: connection was successfully established with %s\n", rc.url))
-			rc.options.OnConnectCallback()
-			if rc.options.KeepAliveTimeout != 0 {
-				rc.keepAlive()
-			}
-			return
-		}
-
-		if rc.ctx.Err() != nil {
-			rc.options.LogFn.Error(rc.ctx.Err(), "dial error")
-			return
-		}
-
-		waitDuration := b.Duration()
-		rc.options.LogFn.Error(err, fmt.Sprintf("dial error, will try again in %d seconds", waitDuration))
-		time.Sleep(waitDuration)
-	}
+	return rc.state == targetState
 }
 
 func (rc *recConn) GetHTTPResponse() *http.Response {
@@ -411,13 +417,6 @@ func (rc *recConn) GetHTTPResponse() *http.Response {
 	defer rc.mu.RUnlock()
 
 	return rc.httpResp
-}
-
-func (rc *recConn) GetDialError() error {
-	rc.mu.RLock()
-	defer rc.mu.RUnlock()
-
-	return rc.dialErr
 }
 
 func (rc *recConn) IsConnected() bool {
