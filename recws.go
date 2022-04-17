@@ -30,18 +30,64 @@ var (
 )
 
 type RecConn interface {
+	// Close closes the underlying network connection without
+	// sending or waiting for a close frame.
 	Close()
+
+	// CloseAndReconnect closes the underlying connection and tries to reconnect.
 	CloseAndReconnect()
+
+	// Shutdown gracefully closes the connection by sending the websocket.CloseMessage.
+	// The writeWait param defines the duration before the deadline of the write operation is hit.
 	Shutdown(writeWait time.Duration)
+
+	// ReadMessage is a helper method for getting a reader
+	// using NextReader and reading from that reader to a buffer.
+	//
+	// If the connection is closed ErrNotConnected is returned.
 	ReadMessage() (messageType int, message []byte, err error)
+
+	// WriteMessage is a helper method for getting a writer using NextWriter,
+	// writing the message and closing the writer.
+	//
+	// If the connection is closed ErrNotConnected is returned.
 	WriteMessage(messageType int, data []byte) error
+
+	// WriteJSON writes the JSON encoding of v to the connection.
+	//
+	// See the documentation for encoding/json Marshal for details about the
+	// conversion of Go values to JSON.
+	//
+	// If the connection is closed ErrNotConnected is returned.
 	WriteJSON(v interface{}) error
+
+	// ReadJSON reads the next JSON-encoded message from the connection and stores
+	// it in the value pointed to by v.
+	//
+	// See the documentation for the encoding/json Unmarshal function for details
+	// about the conversion of JSON to a Go value.
+	//
+	// If the connection is closed ErrNotConnected is returned.
 	ReadJSON(v interface{}) error
+
+	// Dial creates a new client connection by calling DialContext with a background context.
 	Dial()
+
+	// DialContext creates a new client connection.
 	DialContext(ctx context.Context)
+
+	// GetURL returns connection url.
 	GetURL() string
+
+	// GetHTTPResponse returns the http response from the handshake.
+	// Useful when WebSocket handshake fails,
+	// so that callers can handle redirects, authentication, etc.
 	GetHTTPResponse() *http.Response
+
+	// GetDialError returns the last dialer error or nil on successful connection.
 	GetDialError() error
+
+	// IsConnected returns true if the websocket client is connected to the server.
 	IsConnected() bool
 }
 
@@ -119,14 +165,11 @@ func New(url string, requestHeader http.Header, options ...Option) (RecConn, err
 	return &rc, nil
 }
 
-// CloseAndReconnect will try to reconnect.
 func (rc *recConn) CloseAndReconnect() {
 	rc.Close()
 	go rc.connect(nil)
 }
 
-// Close closes the underlying network connection without
-// sending or waiting for a close frame.
 func (rc *recConn) Close() {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
@@ -140,8 +183,6 @@ func (rc *recConn) Close() {
 	rc.state = closedState
 }
 
-// Shutdown gracefully closes the connection by sending the websocket.CloseMessage.
-// The writeWait param defines the duration before the deadline of the write operation is hit.
 func (rc *recConn) Shutdown(writeWait time.Duration) {
 	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
 	err := rc.WriteControl(websocket.CloseMessage, msg, time.Now().Add(writeWait))
@@ -152,10 +193,6 @@ func (rc *recConn) Shutdown(writeWait time.Duration) {
 	}
 }
 
-// ReadMessage is a helper method for getting a reader
-// using NextReader and reading from that reader to a buffer.
-//
-// If the connection is closed ErrNotConnected is returned
 func (rc *recConn) ReadMessage() (messageType int, message []byte, err error) {
 	err = ErrNotConnected
 	if rc.IsConnected() {
@@ -172,10 +209,6 @@ func (rc *recConn) ReadMessage() (messageType int, message []byte, err error) {
 	return
 }
 
-// WriteMessage is a helper method for getting a writer using NextWriter,
-// writing the message and closing the writer.
-//
-// If the connection is closed ErrNotConnected is returned
 func (rc *recConn) WriteMessage(messageType int, data []byte) error {
 	err := ErrNotConnected
 	if rc.IsConnected() {
@@ -194,12 +227,6 @@ func (rc *recConn) WriteMessage(messageType int, data []byte) error {
 	return err
 }
 
-// WriteJSON writes the JSON encoding of v to the connection.
-//
-// See the documentation for encoding/json Marshal for details about the
-// conversion of Go values to JSON.
-//
-// If the connection is closed ErrNotConnected is returned
 func (rc *recConn) WriteJSON(v interface{}) error {
 	err := ErrNotConnected
 	if rc.IsConnected() {
@@ -218,13 +245,6 @@ func (rc *recConn) WriteJSON(v interface{}) error {
 	return err
 }
 
-// ReadJSON reads the next JSON-encoded message from the connection and stores
-// it in the value pointed to by v.
-//
-// See the documentation for the encoding/json Unmarshal function for details
-// about the conversion of JSON to a Go value.
-//
-// If the connection is closed ErrNotConnected is returned
 func (rc *recConn) ReadJSON(v interface{}) error {
 	err := ErrNotConnected
 	if rc.IsConnected() {
@@ -241,12 +261,10 @@ func (rc *recConn) ReadJSON(v interface{}) error {
 	return err
 }
 
-// Dial creates a new client connection by calling DialContext with a background context.
 func (rc *recConn) Dial() {
 	rc.DialContext(context.Background())
 }
 
-// DialContext creates a new client connection.
 func (rc *recConn) DialContext(ctx context.Context) {
 	rc.ctx = ctx
 
@@ -270,7 +288,6 @@ func (rc *recConn) DialContext(ctx context.Context) {
 	}
 }
 
-// GetURL returns current connection url
 func (rc *recConn) GetURL() string {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
@@ -389,9 +406,6 @@ func (rc *recConn) connect(connCh chan<- struct{}) {
 	}
 }
 
-// GetHTTPResponse returns the http response from the handshake.
-// Useful when WebSocket handshake fails,
-// so that callers can handle redirects, authentication, etc.
 func (rc *recConn) GetHTTPResponse() *http.Response {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
@@ -399,8 +413,6 @@ func (rc *recConn) GetHTTPResponse() *http.Response {
 	return rc.httpResp
 }
 
-// GetDialError returns the last dialer error.
-// nil on successful connection.
 func (rc *recConn) GetDialError() error {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
@@ -408,7 +420,6 @@ func (rc *recConn) GetDialError() error {
 	return rc.dialErr
 }
 
-// IsConnected returns true if the websocket is connected
 func (rc *recConn) IsConnected() bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
