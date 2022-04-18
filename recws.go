@@ -207,68 +207,72 @@ func (rc *recConn) Shutdown(writeWait time.Duration) {
 }
 
 func (rc *recConn) ReadMessage() (messageType int, message []byte, err error) {
-	err = ErrNotConnected
-	if rc.IsConnected() {
-		messageType, message, err = rc.Conn.ReadMessage()
-		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close(false)
+	if !rc.IsConnected() {
+		return messageType, message, ErrNotConnected
+	}
+
+	messageType, message, err = rc.Conn.ReadMessage()
+	if err != nil {
+		if websocket.IsCloseError(err, websocket.CloseNormalClosure) && rc.options.RespectServerClosure {
+			rc.Close(true)
 			return messageType, message, nil
 		}
-		if err != nil {
-			rc.CloseAndReconnect()
-		}
+		rc.CloseAndReconnect()
 	}
 
 	return
 }
 
-func (rc *recConn) WriteMessage(messageType int, data []byte) error {
-	err := ErrNotConnected
-	if rc.IsConnected() {
-		rc.mu.Lock()
-		err = rc.Conn.WriteMessage(messageType, data)
-		rc.mu.Unlock()
-		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close(false)
+func (rc *recConn) WriteMessage(messageType int, data []byte) (err error) {
+	if !rc.IsConnected() {
+		return ErrNotConnected
+	}
+
+	rc.mu.Lock()
+	err = rc.Conn.WriteMessage(messageType, data)
+	rc.mu.Unlock()
+	if err != nil {
+		if websocket.IsCloseError(err, websocket.CloseNormalClosure) && rc.options.RespectServerClosure {
+			rc.Close(true)
 			return nil
 		}
-		if err != nil {
-			rc.CloseAndReconnect()
-		}
+		rc.CloseAndReconnect()
 	}
 
 	return err
 }
 
-func (rc *recConn) WriteJSON(v interface{}) error {
-	err := ErrNotConnected
-	if rc.IsConnected() {
-		rc.mu.Lock()
-		err = rc.Conn.WriteJSON(v)
-		rc.mu.Unlock()
-		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			rc.Close(false)
+func (rc *recConn) WriteJSON(v interface{}) (err error) {
+	if !rc.IsConnected() {
+		return ErrNotConnected
+	}
+
+	rc.mu.Lock()
+	err = rc.Conn.WriteJSON(v)
+	rc.mu.Unlock()
+	if err != nil {
+		if websocket.IsCloseError(err, websocket.CloseNormalClosure) && rc.options.RespectServerClosure {
+			rc.Close(true)
 			return nil
 		}
-		if err != nil {
-			rc.CloseAndReconnect()
-		}
+		rc.CloseAndReconnect()
 	}
 
 	return err
 }
 
-func (rc *recConn) ReadJSON(v interface{}) error {
-	err := ErrNotConnected
-	if rc.IsConnected() {
-		err = rc.Conn.ReadJSON(v)
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-				rc.Close(false)
-				return nil
-			}
-			rc.CloseAndReconnect()
+func (rc *recConn) ReadJSON(v interface{}) (err error) {
+	if !rc.IsConnected() {
+		return ErrNotConnected
+	}
+
+	err = rc.Conn.ReadJSON(v)
+	if err != nil {
+		if websocket.IsCloseError(err, websocket.CloseNormalClosure) && rc.options.RespectServerClosure {
+			rc.Close(true)
+			return nil
 		}
+		rc.CloseAndReconnect()
 	}
 
 	return err

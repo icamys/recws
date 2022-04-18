@@ -17,6 +17,9 @@ type connOptions struct {
 	// ReconnectIntervalFactor specifies the rate of increase of the reconnection
 	// interval, default to 1.5
 	ReconnectIntervalFactor float64
+	// RespectServerClosure specifies whether the client should stop trying to reconnect
+	// if the server asked so by sending the normal closure message.
+	RespectServerClosure bool
 	// HandshakeTimeout specifies the duration for the handshake to complete,
 	// default to 2 seconds
 	HandshakeTimeout time.Duration
@@ -98,5 +101,11 @@ func WithDebugLogFn(fn func(string)) Option {
 func WithErrorLogFn(fn func(error, string)) Option {
 	return func(o *connOptions) {
 		o.LogFn.Error = fn
+	}
+}
+
+func WithRespectServerClosure(r bool) Option {
+	return func(o *connOptions) {
+		o.RespectServerClosure = r
 	}
 }
