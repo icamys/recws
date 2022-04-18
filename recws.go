@@ -91,7 +91,7 @@ type RecConn interface {
 
 // The recConn type represents a Reconnecting WebSocket connection.
 type recConn struct {
-	options         connOptions
+	options         ConnectionOptions
 	state           int
 	mu              sync.RWMutex
 	url             string
@@ -131,7 +131,7 @@ func New(url string, requestHeader http.Header, options ...Option) (RecConn, err
 	)
 
 	rc := recConn{
-		options: connOptions{
+		options: ConnectionOptions{
 			ReconnectIntervalMin:    defaultReconnectIntervalMin,
 			ReconnectIntervalMax:    defaultReconnectIntervalMax,
 			ReconnectIntervalFactor: defaultReconnectIntervalFactor,
