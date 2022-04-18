@@ -91,13 +91,15 @@ type RecConn interface {
 
 // The recConn type represents a Reconnecting WebSocket connection.
 type recConn struct {
-	options   connOptions
-	state     int
-	mu        sync.RWMutex
-	url       string
-	reqHeader http.Header
-	httpResp  *http.Response
-	dialer    *websocket.Dialer
+	options         connOptions
+	state           int
+	mu              sync.RWMutex
+	url             string
+	reqHeader       http.Header
+	httpResp        *http.Response
+	dialer          *websocket.Dialer
+	keepaliveCtx    context.Context
+	keepaliveCancel context.CancelFunc
 
 	*websocket.Conn
 }
@@ -173,6 +175,10 @@ func (rc *recConn) CloseAndReconnect() {
 func (rc *recConn) Close(forever bool) {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
+
+	if rc.keepaliveCancel != nil {
+		rc.keepaliveCancel()
+	}
 
 	if rc.state&(closedState|closedForeverState) > 0 {
 		return
@@ -290,7 +296,7 @@ func (rc *recConn) DialContext(ctx context.Context) error {
 	rc.mu.Unlock()
 
 	rc.options.OnConnectCallback()
-	if rc.options.KeepAliveTimeout != 0 {
+	if rc.IsKeepAliveEnabled() {
 		rc.keepAlive()
 	}
 
@@ -320,7 +326,7 @@ func (rc *recConn) reconnect() error {
 
 		if err == nil {
 			rc.options.OnConnectCallback()
-			if rc.options.KeepAliveTimeout != 0 {
+			if rc.IsKeepAliveEnabled() {
 				rc.keepAlive()
 			}
 			return nil
@@ -361,29 +367,45 @@ func (rc *recConn) keepAlive() {
 		keepAliveResponse.setLastResponse()
 		return nil
 	})
+	if rc.keepaliveCancel != nil { // cancel previous context if there's any
+		rc.keepaliveCancel()
+	}
+	rc.keepaliveCtx, rc.keepaliveCancel = context.WithCancel(context.Background())
 	rc.mu.Unlock()
 
 	go func() {
 		var ticker = time.NewTicker(rc.options.KeepAliveTimeout)
 		defer ticker.Stop()
+
+		if err := rc.writeControlPingMessage(); err != nil {
+			rc.options.LogFn.Error(err, "error in writing ping message")
+		}
+
 		for {
-			if !rc.IsConnected() {
-				continue
-			}
-
-			writeTime := time.Now()
-			if err := rc.writeControlPingMessage(); err != nil {
-				rc.options.LogFn.Error(err, "error in writing ping message")
-			}
-			tick := <-ticker.C
-			pingPongDuration := keepAliveResponse.getLastResponse().Sub(writeTime)
-			if pingPongDuration < 1*time.Millisecond {
-				pingPongDuration = 1 * time.Millisecond
-			}
-
-			if tick.Sub(keepAliveResponse.getLastResponse().Add(pingPongDuration)) > rc.options.KeepAliveTimeout {
-				rc.CloseAndReconnect()
+			select {
+			case <-rc.keepaliveCtx.Done():
 				return
+			case <-ticker.C:
+				if err := rc.writeControlPingMessage(); err != nil {
+					rc.options.LogFn.Error(err, "error in writing ping message")
+				}
+			}
+		}
+	}()
+
+	go func() {
+		var ticker = time.NewTicker(rc.options.KeepAliveTimeout)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-rc.keepaliveCtx.Done():
+				return
+			case tick := <-ticker.C:
+				if tick.Sub(keepAliveResponse.getLastResponse().Add(time.Millisecond)) > rc.options.KeepAliveTimeout {
+					go rc.CloseAndReconnect()
+					return
+				}
 			}
 		}
 	}()
@@ -405,11 +427,12 @@ func (rc *recConn) setStateIfNot(targetState, conditionState int) bool {
 	rc.mu.RLock()
 	defer rc.mu.RUnlock()
 
-	if !(rc.state&conditionState > 0) {
+	if rc.state&conditionState == 0 {
 		rc.state = targetState
+		return true
 	}
 
-	return rc.state == targetState
+	return false
 }
 
 func (rc *recConn) GetHTTPResponse() *http.Response {
@@ -424,6 +447,10 @@ func (rc *recConn) IsConnected() bool {
 	defer rc.mu.RUnlock()
 
 	return rc.state == connectedState
+}
+
+func (rc *recConn) IsKeepAliveEnabled() bool {
+	return rc.options.KeepAliveTimeout > 0
 }
 
 // isValidUrl checks whether url is valid
